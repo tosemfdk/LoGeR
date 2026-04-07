@@ -4,7 +4,6 @@ import time
 import threading
 import argparse
 import inspect
-import math
 import tempfile
 import shutil
 import yaml
@@ -20,6 +19,7 @@ from loger.utils.rotation import mat_to_quat
 from loger.utils.geometry import depth_edge
 from loger.models.pi3 import Pi3
 from loger.utils.viser_utils import viser_wrapper
+from loger.utils.image_resolution import normalize_target_resolution_arg, resolve_target_image_size
 
 
 # Helper function to check if a path is a video file
@@ -108,7 +108,13 @@ parser.add_argument(
     help="Name of the model to load from Hugging Face Hub or a local path to a checkpoint."
 )
 parser.add_argument("--config", type=str, default="ckpts/LoGeR_star/original_config.yaml", help="Path to a yaml config file for model initialization.")
-parser.add_argument("--resolution", type=list, default=None, help="Target resolution for input images (shorter side).")
+parser.add_argument(
+    "--resolution",
+    type=int,
+    nargs="+",
+    default=None,
+    help="Target resolution as either '<shorter_side>' or '<width> <height>'.",
+)
 parser.add_argument("--window_size", type=int, default=32, help="Window size for non-causal inference (-1 for full sequence).")
 parser.add_argument("--overlap_size", type=int, default=3, help="Overlap size for sliding window inference.")
 parser.add_argument("--sim3", action="store_true", help="Use sim3 transformation for TTT.")
@@ -269,39 +275,6 @@ def collect_input_image_paths(
     return all_image_names, input_indices, temp_frame_dirs
 
 
-def resolve_target_image_size(
-    image_paths: List[str],
-    PIXEL_LIMIT: int = 255000,
-    Target_W: Optional[int] = None,
-    Target_H: Optional[int] = None,
-) -> Tuple[int, int]:
-    if Target_W is not None and Target_H is not None:
-        return Target_W, Target_H
-
-    first_valid_path = None
-    for img_path in image_paths:
-        if os.path.isfile(img_path):
-            first_valid_path = img_path
-            break
-
-    if first_valid_path is None:
-        raise FileNotFoundError("Could not determine target size because no valid image paths were found.")
-
-    with Image.open(first_valid_path) as first_img:
-        first_img = first_img.convert("RGB")
-        W_orig, H_orig = first_img.size
-
-    scale = math.sqrt(PIXEL_LIMIT / (W_orig * H_orig)) if W_orig * H_orig > 0 else 1
-    W_target, H_target = W_orig * scale, H_orig * scale
-    k, m = round(W_target / 14), round(H_target / 14)
-    while (k * 14) * (m * 14) > PIXEL_LIMIT:
-        if k / m > W_target / H_target:
-            k -= 1
-        else:
-            m -= 1
-    return max(1, k) * 14, max(1, m) * 14
-
-
 def load_image_chunk_from_paths(
     image_paths: List[str],
     target_size: Tuple[int, int],
@@ -420,10 +393,16 @@ def run_streaming_inference(
     model_obj = model_obj.to(device)
     forward_kwargs = dict(forward_kwargs or {})
 
+    target_resolution = normalize_target_resolution_arg(target_resolution)
+    target_width = target_resolution[0] if target_resolution and len(target_resolution) == 2 else None
+    target_height = target_resolution[1] if target_resolution and len(target_resolution) == 2 else None
+    target_short_side = target_resolution[0] if target_resolution and len(target_resolution) == 1 else None
+
     target_size = resolve_target_image_size(
         image_paths,
-        Target_W=target_resolution[0] if target_resolution else None,
-        Target_H=target_resolution[1] if target_resolution else None,
+        target_width=target_width,
+        target_height=target_height,
+        target_short_side=target_short_side,
     )
     print(f"All images will be resized to a uniform size: ({target_size[0]}, {target_size[1]})")
 
@@ -672,7 +651,7 @@ def main():
     temp_frame_dirs = {}
     input_indices = {}
     image_folder_for_sky = None
-    target_resolution = args.resolution if args.resolution and len(args.resolution) == 2 else None
+    target_resolution = normalize_target_resolution_arg(args.resolution)
     
     # Generate seq_name automatically if not provided, similar to demo_viser.py
     if args.seq_name is None:
