@@ -13,7 +13,7 @@ import cv2
 from PIL import Image
 from torchvision import transforms
 from natsort import natsorted
-from typing import List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from pathlib import Path
 from loger.utils.rotation import mat_to_quat
@@ -221,6 +221,333 @@ def load_pi3_model(model_name: str, config_path: Optional[str] = None, pi3x: boo
     return model
 
 
+def collect_input_image_paths(
+    input_paths: List[str],
+    start_frame: int,
+    end_frame: int,
+    stride: int,
+) -> Tuple[List[str], Dict[str, int], Dict[str, str]]:
+    temp_frame_dirs: Dict[str, str] = {}
+    input_indices: Dict[str, int] = {}
+    all_image_names: List[str] = []
+
+    for i, input_path in enumerate(input_paths):
+        input_key = f"input{i+1}"
+        if i > 0:
+            input_indices[f"cam{i:02d}"] = len(all_image_names)
+
+        if is_video_file(input_path):
+            temp_dir = tempfile.mkdtemp(prefix=f"pi3_frames_{input_key}_")
+            temp_frame_dirs[input_key] = temp_dir
+            image_names_current_input = extract_frames_from_video(input_path, temp_dir, start_frame, end_frame, stride)
+        elif os.path.isdir(input_path):
+            image_names_current_input = natsorted(
+                glob.glob(os.path.join(input_path, "*.png"))
+                + glob.glob(os.path.join(input_path, "*.jpg"))
+                + glob.glob(os.path.join(input_path, "*.jpeg"))
+            )
+            image_names_current_input = [
+                f for f in image_names_current_input if "depth" not in os.path.basename(f).lower()
+            ]
+            end_idx = end_frame if end_frame != -1 else None
+            image_names_current_input = image_names_current_input[start_frame:end_idx:stride]
+        else:
+            print(f"Warning: Input path {input_path} is not a valid video file or directory. Skipping.")
+            image_names_current_input = []
+
+        if not image_names_current_input:
+            if input_key in temp_frame_dirs:
+                if os.path.exists(temp_frame_dirs[input_key]):
+                    shutil.rmtree(temp_frame_dirs[input_key])
+                del temp_frame_dirs[input_key]
+            if f"cam{i:02d}" in input_indices:
+                del input_indices[f"cam{i:02d}"]
+            continue
+
+        all_image_names.extend(image_names_current_input)
+
+    return all_image_names, input_indices, temp_frame_dirs
+
+
+def resolve_target_image_size(
+    image_paths: List[str],
+    PIXEL_LIMIT: int = 255000,
+    Target_W: Optional[int] = None,
+    Target_H: Optional[int] = None,
+) -> Tuple[int, int]:
+    if Target_W is not None and Target_H is not None:
+        return Target_W, Target_H
+
+    first_valid_path = None
+    for img_path in image_paths:
+        if os.path.isfile(img_path):
+            first_valid_path = img_path
+            break
+
+    if first_valid_path is None:
+        raise FileNotFoundError("Could not determine target size because no valid image paths were found.")
+
+    with Image.open(first_valid_path) as first_img:
+        first_img = first_img.convert("RGB")
+        W_orig, H_orig = first_img.size
+
+    scale = math.sqrt(PIXEL_LIMIT / (W_orig * H_orig)) if W_orig * H_orig > 0 else 1
+    W_target, H_target = W_orig * scale, H_orig * scale
+    k, m = round(W_target / 14), round(H_target / 14)
+    while (k * 14) * (m * 14) > PIXEL_LIMIT:
+        if k / m > W_target / H_target:
+            k -= 1
+        else:
+            m -= 1
+    return max(1, k) * 14, max(1, m) * 14
+
+
+def load_image_chunk_from_paths(
+    image_paths: List[str],
+    target_size: Tuple[int, int],
+) -> torch.Tensor:
+    target_w, target_h = target_size
+    tensor_list = []
+    to_tensor_transform = transforms.ToTensor()
+
+    for img_path in image_paths:
+        try:
+            with Image.open(img_path) as img_pil:
+                resized_img = img_pil.convert("RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
+            tensor_list.append(to_tensor_transform(resized_img))
+        except Exception as e:
+            raise RuntimeError(f"Could not load or process image {img_path}: {e}") from e
+
+    if not tensor_list:
+        return torch.empty(0)
+    return torch.stack(tensor_list, dim=0)
+
+
+def iter_preprocessed_image_windows(
+    image_paths: List[str],
+    windows: List[Tuple[int, int]],
+    target_size: Tuple[int, int],
+) -> Iterator[Tuple[int, int, List[str], torch.Tensor]]:
+    cached_paths: List[str] = []
+    cached_tensor: Optional[torch.Tensor] = None
+
+    for window_idx, (start_idx, end_idx) in enumerate(windows):
+        window_paths = image_paths[start_idx:end_idx]
+        reuse_count = len(cached_paths) if cached_paths and window_paths[:len(cached_paths)] == cached_paths else 0
+
+        chunk_parts = []
+        if reuse_count > 0 and cached_tensor is not None:
+            chunk_parts.append(cached_tensor)
+
+        if reuse_count < len(window_paths):
+            new_tensor = load_image_chunk_from_paths(window_paths[reuse_count:], target_size)
+            if new_tensor.numel() == 0:
+                raise RuntimeError(f"Window {window_idx} produced an empty tensor.")
+            chunk_parts.append(new_tensor)
+        else:
+            new_tensor = None
+
+        if not chunk_parts:
+            raise RuntimeError(f"Window {window_idx} produced no data.")
+
+        chunk_tensor = chunk_parts[0] if len(chunk_parts) == 1 else torch.cat(chunk_parts, dim=0)
+
+        next_start_idx = windows[window_idx + 1][0] if window_idx + 1 < len(windows) else end_idx
+        cache_count = max(0, end_idx - next_start_idx)
+        if cache_count > 0:
+            cached_paths = window_paths[-cache_count:]
+            cached_tensor = chunk_tensor[-cache_count:].clone()
+        else:
+            cached_paths = []
+            cached_tensor = None
+
+        yield start_idx, end_idx, window_paths, chunk_tensor
+
+        if new_tensor is not None:
+            del new_tensor
+
+
+def build_forward_kwargs_from_args(args) -> Dict[str, object]:
+    forward_kwargs: Dict[str, object] = {}
+    if args.config:
+        try:
+            with open(args.config, 'r') as f:
+                config = yaml.safe_load(f)
+
+            training_settings = config.get('training_settings', {})
+            model_settings = config.get('model', {})
+            se3_from_config = model_settings.get('se3', config.get('se3', False))
+            se3_value = args.se3 if args.se3 is not None else bool(se3_from_config)
+            forward_kwargs.update({
+                'window_size': args.window_size if args.window_size is not None else training_settings.get('window_size', -1),
+                'overlap_size': args.overlap_size if args.overlap_size is not None else training_settings.get('overlap_size', 0),
+                'reset_every': args.reset_every if args.reset_every is not None else training_settings.get('reset_every', 0),
+                'num_iterations': config.get('num_iterations', 1),
+                'sim3': config.get('sim3', False) or args.sim3,
+                'sim3_scale_mode': args.sim3_scale_mode,
+                'se3': se3_value,
+                'turn_off_ttt': args.no_ttt,
+                'turn_off_swa': args.no_swa,
+            })
+            print(f"Forward pass kwargs from config: {forward_kwargs}")
+        except Exception as e:
+            print(f"Could not read config for forward pass arguments: {e}")
+    elif args.window_size or args.overlap_size or args.sim3 or args.reset_every is not None:
+        forward_kwargs.update({
+            'window_size': args.window_size,
+            'overlap_size': args.overlap_size,
+            'sim3': args.sim3,
+            'se3': bool(args.se3) if args.se3 is not None else False,
+            'sim3_scale_mode': args.sim3_scale_mode,
+            'reset_every': args.reset_every if args.reset_every is not None else 0,
+        })
+    return forward_kwargs
+
+
+def run_streaming_inference(
+    model_obj: Pi3,
+    image_paths: List[str],
+    device: str,
+    forward_kwargs: Optional[Dict[str, object]] = None,
+    target_resolution: Optional[List[int]] = None,
+    warmup: bool = False,
+    benchmark: bool = False,
+):
+    if not image_paths:
+        raise ValueError("No image paths were provided for streaming inference.")
+
+    model_obj.eval()
+    model_obj = model_obj.to(device)
+    forward_kwargs = dict(forward_kwargs or {})
+
+    target_size = resolve_target_image_size(
+        image_paths,
+        Target_W=target_resolution[0] if target_resolution else None,
+        Target_H=target_resolution[1] if target_resolution else None,
+    )
+    print(f"All images will be resized to a uniform size: ({target_size[0]}, {target_size[1]})")
+
+    windows = model_obj.get_window_ranges(
+        len(image_paths),
+        int(forward_kwargs.get("window_size", -1)),
+        int(forward_kwargs.get("overlap_size", 1)),
+    )
+    print(f"Streaming {len(image_paths)} images across {len(windows)} chunk(s).")
+
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
+
+    def execute_stream_pass():
+        stream_state = model_obj.init_stream_state(len(image_paths), **forward_kwargs)
+        last_chunk_shape = None
+
+        for start_idx, end_idx, _, chunk_tensor_cpu in iter_preprocessed_image_windows(image_paths, windows, target_size):
+            if chunk_tensor_cpu.shape[0] != (end_idx - start_idx):
+                raise RuntimeError(
+                    f"Window [{start_idx}, {end_idx}) loaded {chunk_tensor_cpu.shape[0]} frames."
+                )
+
+            last_chunk_shape = chunk_tensor_cpu.shape
+            chunk_images_cpu = chunk_tensor_cpu.unsqueeze(0).permute(0, 1, 3, 4, 2).contiguous()
+            chunk_tensor_gpu = chunk_tensor_cpu.to(device)
+
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
+                chunk_predictions = model_obj.consume_stream_chunk(
+                    chunk_tensor_gpu,
+                    stream_state,
+                    images_payload=chunk_images_cpu,
+                )
+
+            del chunk_predictions
+            del chunk_tensor_gpu
+            del chunk_images_cpu
+            del chunk_tensor_cpu
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return model_obj.finalize_stream(stream_state), last_chunk_shape
+
+    if warmup or benchmark:
+        warmup_window = windows[0]
+        _, _, _, warmup_chunk_cpu = next(iter_preprocessed_image_windows(image_paths, [warmup_window], target_size))
+        warmup_chunk_gpu = warmup_chunk_cpu.to(device)
+        print("Running warmup inference on the first streaming chunk...")
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
+            _ = model_obj(warmup_chunk_gpu[None], **forward_kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        del warmup_chunk_gpu
+        del warmup_chunk_cpu
+        print("Warmup complete.")
+
+    if benchmark:
+        num_runs = 3
+        print(f"\nRunning streaming benchmark with {num_runs} inference passes...")
+        inference_times = []
+        raw_model_predictions = None
+        final_chunk_shape = None
+        for run_idx in range(num_runs):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_start = time.time()
+            raw_model_predictions, final_chunk_shape = execute_stream_pass()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_end = time.time()
+            inference_times.append(t_end - t_start)
+            print(f"  Run {run_idx + 1}/{num_runs}: {t_end - t_start:.3f}s")
+
+        avg_time = sum(inference_times) / len(inference_times)
+        min_time = min(inference_times)
+        max_time = max(inference_times)
+        std_time = (sum((t - avg_time) ** 2 for t in inference_times) / len(inference_times)) ** 0.5
+
+        print(f"\n{'='*50}")
+        print(f"Benchmark Results ({num_runs} runs):")
+        print(f"  Total frames: {len(image_paths)}")
+        print(f"  Avg inference time: {avg_time:.3f}s (std: {std_time:.3f}s)")
+        print(f"  Min/Max: {min_time:.3f}s / {max_time:.3f}s")
+        print(f"  Avg FPS: {len(image_paths) / avg_time:.2f}")
+        print(f"  Avg time per frame: {(avg_time / len(image_paths)) * 1000:.2f} ms")
+        print(f"{'='*50}\n")
+        inference_time = avg_time
+    else:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        inference_start_time = time.time()
+        raw_model_predictions, final_chunk_shape = execute_stream_pass()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        inference_end_time = time.time()
+
+        inference_time = inference_end_time - inference_start_time
+        fps = len(image_paths) / inference_time
+        ms_per_frame = (inference_time / len(image_paths)) * 1000
+        print(f"\n{'='*50}")
+        print("Inference Timing Results:")
+        print(f"  Total frames: {len(image_paths)}")
+        print(f"  Inference time: {inference_time:.3f} seconds")
+        print(f"  FPS: {fps:.2f}")
+        print(f"  Time per frame: {ms_per_frame:.2f} ms")
+        if not warmup:
+            print("  (Note: First run includes torch.compile overhead. Use --warmup for accurate timing)")
+        print(f"{'='*50}\n")
+
+    if raw_model_predictions is None:
+        raise RuntimeError("Streaming inference did not produce any predictions.")
+
+    if "conf" in raw_model_predictions and raw_model_predictions["conf"] is not None:
+        raw_model_predictions["conf"] = torch.sigmoid(raw_model_predictions["conf"])
+    if "local_points" in raw_model_predictions:
+        del raw_model_predictions["local_points"]
+
+    if final_chunk_shape is not None:
+        print(f"Last processed chunk tensor shape: {final_chunk_shape}")
+
+    return raw_model_predictions, target_size, inference_time
+
+
 def run_core_inference(
     model_obj: Pi3,
     input_paths: List[str],
@@ -233,61 +560,30 @@ def run_core_inference(
     """
     Handles data preparation and runs the core model inference for Pi3.
     """
-    model_obj.eval()
-    model_obj = model_obj.to(device)
-    
-    temp_frame_dirs = {}
-    input_indices = {}
-    all_image_names = []
-    
-    for i, input_path in enumerate(input_paths):
-        input_key = f"input{i+1}"
-        if i > 0:
-            input_indices[f"cam{i:02d}"] = len(all_image_names)
-        
-        if is_video_file(input_path):
-            temp_dir = tempfile.mkdtemp(prefix=f"pi3_frames_{input_key}_")
-            temp_frame_dirs[input_key] = temp_dir
-            image_names_current_input = extract_frames_from_video(input_path, temp_dir, start_frame, end_frame, stride)
-        elif os.path.isdir(input_path):
-            image_names_current_input = natsorted(glob.glob(os.path.join(input_path, "*.png"))+glob.glob(os.path.join(input_path, "*.jpg"))+glob.glob(os.path.join(input_path, "*.jpeg")))
-            end_idx = end_frame if end_frame != -1 else None
-            image_names_current_input = image_names_current_input[start_frame:end_idx:stride]
-        else:
-            print(f"Warning: Input path {input_path} is not a valid video file or directory. Skipping.")
-            image_names_current_input = []
-
-        if not image_names_current_input:
-            if input_key in temp_frame_dirs:
-                if os.path.exists(temp_frame_dirs[input_key]): shutil.rmtree(temp_frame_dirs[input_key])
-                del temp_frame_dirs[input_key]
-            if f"cam{i:02d}" in input_indices: del input_indices[f"cam{i:02d}"]
-        else:
-            all_image_names.extend(image_names_current_input)
-
+    all_image_names, input_indices, temp_frame_dirs = collect_input_image_paths(
+        input_paths,
+        start_frame,
+        end_frame,
+        stride,
+    )
     if not all_image_names:
         print("Error: No images found from any input.")
         return None, [], {}, {}
-        
-    print(f"Loading images from combined inputs ({len(all_image_names)} images found)...")
-    # Use load_images_from_paths to load exactly the images we collected
-    images_tensor = load_images_from_paths(all_image_names, Target_W=target_resolution[0], Target_H=target_resolution[1]).to(device)
-    print(f"Preprocessed images tensor shape: {images_tensor.shape}")
 
-    print("Running inference...")    
-    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
+    print(f"Running streaming core inference for {len(all_image_names)} images...")
+    raw_model_predictions, _, _ = run_streaming_inference(
+        model_obj,
+        all_image_names,
+        device=device,
+        forward_kwargs={},
+        target_resolution=target_resolution,
+        warmup=False,
+        benchmark=False,
+    )
 
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-        raw_model_predictions = model_obj(images_tensor[None]) # Add batch dimension
-    
-    # Post-process predictions
-    raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2) # B, S, H, W, C
-    raw_model_predictions['conf'] = torch.sigmoid(raw_model_predictions['conf'])
-    edge = depth_edge(raw_model_predictions['local_points'][..., 2], rtol=0.03)
-    raw_model_predictions['conf'][edge] = 0.0
-    if 'local_points' in raw_model_predictions:
-        del raw_model_predictions['local_points']
-
+    if 'points' in raw_model_predictions and 'conf' in raw_model_predictions:
+        edge = depth_edge(raw_model_predictions['points'][..., 2], rtol=0.03)
+        raw_model_predictions['conf'][edge] = 0.0
     return raw_model_predictions, all_image_names, input_indices, temp_frame_dirs
 
 
@@ -361,50 +657,6 @@ def write_trajectory_txt(output_path: Path, timestamps, translations, quaternion
             )
 
 
-def load_images_from_paths(image_paths, PIXEL_LIMIT=255000, Target_W=None, Target_H=None, verbose=True):
-    sources = []
-    for img_path in image_paths:
-        try:
-            sources.append(Image.open(img_path).convert('RGB'))
-        except Exception as e:
-            print(f"Could not load image {img_path}: {e}")
-
-    if not sources:
-        print("No images found or loaded.")
-        return torch.empty(0)
-
-    if Target_W is None and Target_H is None:
-        first_img = sources[0]
-        W_orig, H_orig = first_img.size
-        scale = math.sqrt(PIXEL_LIMIT / (W_orig * H_orig)) if W_orig * H_orig > 0 else 1
-        W_target, H_target = W_orig * scale, H_orig * scale
-        k, m = round(W_target / 14), round(H_target / 14)
-        while (k * 14) * (m * 14) > PIXEL_LIMIT:
-            if k / m > W_target / H_target: k -= 1
-            else: m -= 1
-        TARGET_W, TARGET_H = max(1, k) * 14, max(1, m) * 14
-    else:
-        TARGET_W, TARGET_H = Target_W, Target_H
-    
-    if verbose:
-        print(f"All images will be resized to a uniform size: ({TARGET_W}, {TARGET_H})")
-
-    tensor_list = []
-    to_tensor_transform = transforms.ToTensor()
-    
-    for img_pil in sources:
-        try:
-            resized_img = img_pil.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
-            img_tensor = to_tensor_transform(resized_img)
-            tensor_list.append(img_tensor)
-        except Exception as e:
-            print(f"Error processing an image: {e}")
-
-    if not tensor_list:
-        return torch.empty(0)
-
-    return torch.stack(tensor_list, dim=0)
-
 def main():
     args = parser.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -474,162 +726,30 @@ def main():
         model = model.eval()
 
         input_paths = [p for p in [args.input, args.input2, args.input3, args.input4, args.input5] if p is not None]
-        
-        all_image_names_collected = []
-        input_indices = {}
-        
-        for i, input_path in enumerate(input_paths):
-            if i > 0: input_indices[f"cam{i:02d}"] = len(all_image_names_collected)
 
-            if is_video_file(input_path):
-                # Video frames for each input are extracted to its own sub-folder
-                temp_dir = tempfile.mkdtemp(prefix=f"pi3_frames_input{i+1}_")
-                temp_frame_dirs[f"input{i+1}"] = temp_dir
-                current_frames = extract_frames_from_video(input_path, temp_dir, args.start_frame, args.end_frame, args.stride)
-                all_image_names_collected.extend(current_frames)
-            elif os.path.isdir(input_path):
-                current_frames = natsorted(glob.glob(os.path.join(input_path, "*.png"))+glob.glob(os.path.join(input_path, "*.jpg"))+glob.glob(os.path.join(input_path, "*.jpeg")))
-                # remove the files that has depth in the name
-                current_frames = [f for f in current_frames if "depth" not in os.path.basename(f).lower()]
-                end_idx = args.end_frame if args.end_frame != -1 else None
-                current_frames = current_frames[args.start_frame:end_idx:args.stride]
-                all_image_names_collected.extend(current_frames)
-        
+        all_image_names_collected, input_indices, temp_frame_dirs = collect_input_image_paths(
+            input_paths,
+            args.start_frame,
+            args.end_frame,
+            args.stride,
+        )
+
         if not all_image_names_collected:
             print("No images to process. Exiting.")
             return
             
         print(f"Found {len(all_image_names_collected)} images to process.")
-        if target_resolution is not None:
-            images_tensor = load_images_from_paths(all_image_names_collected, Target_W=target_resolution[0], Target_H=target_resolution[1]).to(device)
-        else:
-            images_tensor = load_images_from_paths(all_image_names_collected).to(device)
-        
         image_folder_for_sky = os.path.dirname(all_image_names_collected[0]) if all_image_names_collected else None
-
-        if images_tensor.numel() == 0:
-            print("Error: No images were loaded successfully. Check image paths and formats.")
-            return
-
-        print("Running inference...")
-        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
-        num_frames = images_tensor.shape[0]
-        
-        forward_kwargs = {}
-        if args.config:
-            try:
-                with open(args.config, 'r') as f:
-                    config = yaml.safe_load(f)
-
-                training_settings = config.get('training_settings', {})
-                model_settings = config.get('model', {})
-                se3_from_config = model_settings.get('se3', config.get('se3', False))
-                se3_value = args.se3 if args.se3 is not None else bool(se3_from_config)
-                forward_kwargs.update({
-                    'window_size': args.window_size if args.window_size is not None else training_settings.get('window_size', -1),
-                    'overlap_size': args.overlap_size if args.overlap_size is not None else training_settings.get('overlap_size', 0),
-                    'reset_every': args.reset_every if args.reset_every is not None else training_settings.get('reset_every', 0),
-                    'num_iterations': config.get('num_iterations', 1), # Or from training_settings
-                    'sim3': config.get('sim3', False) or args.sim3,
-                    'sim3_scale_mode': args.sim3_scale_mode,
-                    'se3': se3_value,
-                    'turn_off_ttt': args.no_ttt,
-                    'turn_off_swa': args.no_swa,
-                })
-                print(f"Forward pass kwargs from config: {forward_kwargs}")
-
-            except Exception as e:
-                print(f"Could not read config for forward pass arguments: {e}")
-        elif args.window_size or args.overlap_size or args.sim3 or args.reset_every is not None:
-            forward_kwargs.update({
-                'window_size': args.window_size,
-                'overlap_size': args.overlap_size,
-                'window_size': args.window_size,
-                'overlap_size': args.overlap_size,
-                'sim3': args.sim3,
-                'pi3x': args.pi3x,
-                'pi3x_metric': args.pi3x_metric,
-                'se3': bool(args.se3) if args.se3 is not None else False,
-                'sim3_scale_mode': args.sim3_scale_mode,
-                'reset_every': args.reset_every if args.reset_every is not None else 0
-            })
-
-        # Warmup run to trigger torch.compile (first run has compilation overhead)
-        if args.warmup or args.benchmark:
-            print("Running warmup inference (to trigger torch.compile)...")
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-                _ = model(images_tensor[None], **forward_kwargs)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            print("Warmup complete.")
-
-        # Benchmark mode: run multiple times and report statistics
-        if args.benchmark:
-            num_runs = 3
-            print(f"\nRunning benchmark with {num_runs} inference passes...")
-            inference_times = []
-            for run_idx in range(num_runs):
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                t_start = time.time()
-                with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-                    raw_model_predictions = model(images_tensor[None], **forward_kwargs)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                t_end = time.time()
-                inference_times.append(t_end - t_start)
-                print(f"  Run {run_idx + 1}/{num_runs}: {t_end - t_start:.3f}s")
-            
-            avg_time = sum(inference_times) / len(inference_times)
-            min_time = min(inference_times)
-            max_time = max(inference_times)
-            std_time = (sum((t - avg_time) ** 2 for t in inference_times) / len(inference_times)) ** 0.5
-            
-            print(f"\n{'='*50}")
-            print(f"Benchmark Results ({num_runs} runs):")
-            print(f"  Total frames: {num_frames}")
-            print(f"  Avg inference time: {avg_time:.3f}s (std: {std_time:.3f}s)")
-            print(f"  Min/Max: {min_time:.3f}s / {max_time:.3f}s")
-            print(f"  Avg FPS: {num_frames / avg_time:.2f}")
-            print(f"  Avg time per frame: {(avg_time / num_frames) * 1000:.2f} ms")
-            print(f"{'='*50}\n")
-            inference_time = avg_time
-        else:
-            # Single timed inference
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            inference_start_time = time.time()
-            
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-                raw_model_predictions = model(images_tensor[None], **forward_kwargs) # Add batch dimension
-
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            inference_end_time = time.time()
-            
-            # Calculate and display timing
-            inference_time = inference_end_time - inference_start_time
-            fps = num_frames / inference_time
-            ms_per_frame = (inference_time / num_frames) * 1000
-            print(f"\n{'='*50}")
-            print(f"Inference Timing Results:")
-            print(f"  Total frames: {num_frames}")
-            print(f"  Inference time: {inference_time:.3f} seconds")
-            print(f"  FPS: {fps:.2f}")
-            print(f"  Time per frame: {ms_per_frame:.2f} ms")
-            if not args.warmup:
-                print(f"  (Note: First run includes torch.compile overhead. Use --warmup for accurate timing)")
-            print(f"{'='*50}\n")
-
-        # Post-process predictions
-        # Using permute to get (B, S, H, W, C) for easier numpy conversion later
-        raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2) 
-        raw_model_predictions['conf'] = torch.sigmoid(raw_model_predictions['conf'])
-        # Edge mask on depth can be noisy, optional
-        # edge = depth_edge(raw_model_predictions['local_points'][..., 2], rtol=0.03)
-        # raw_model_predictions['conf'][edge] = 0.0
-        if 'local_points' in raw_model_predictions:
-            del raw_model_predictions['local_points']
+        forward_kwargs = build_forward_kwargs_from_args(args)
+        raw_model_predictions, _, _ = run_streaming_inference(
+            model,
+            all_image_names_collected,
+            device=device,
+            forward_kwargs=forward_kwargs,
+            target_resolution=target_resolution,
+            warmup=args.warmup or args.benchmark,
+            benchmark=args.benchmark,
+        )
 
         # Convert all tensors to numpy and remove batch dimension
         # Filter out non-tensor values (e.g., window_ttt_losses which is a list)
