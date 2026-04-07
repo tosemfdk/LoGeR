@@ -3,7 +3,7 @@ import os
 import glob
 import time
 import threading
-from typing import List, Optional, Tuple, Callable, Union
+from typing import List, Optional, Set, Tuple, Callable, Union
 
 import numpy as np
 import torch
@@ -176,7 +176,7 @@ def viser_wrapper(
     cam2world_data = {}
     pcd_handles = {}
     frustums = {}
-    frames_roots = {}
+    frame_roots = {}
     video_previews = {}
     gui_show_cams = {}
     
@@ -330,9 +330,8 @@ def viser_wrapper(
                 print("Using first frame as canonical frame (identity pose).")
 
     for cam_id in cam_ids:
-        pcd_handles[cam_id] = []
-        frustums[cam_id] = []
-        frames_roots[cam_id] = []
+        pcd_handles[cam_id] = {}
+        frustums[cam_id] = {}
 
         # Pi3 provides camera_poses directly, assuming they are camera-to-world 4x4 matrices
         if cam_id == "cam0":
@@ -405,130 +404,141 @@ def viser_wrapper(
         fov=60.0,
     )
 
-    print("Building frames / point clouds …")
-    for i in tqdm(range(S)):
-        f_root_timestep = server.scene.add_frame(f"/frames/t{i}", show_axes=False)
+    loaded_timesteps: Set[int] = set()
+
+    def build_point_cloud(frame_idx: int, cam_id: str) -> Tuple[np.ndarray, np.ndarray]:
+        current_conf = conf_data[cam_id][frame_idx]
+        current_xyz_c = xyz_centered_data[cam_id][frame_idx]
+        current_img = img_data[cam_id][frame_idx]
+
+        mask = gen_mask(current_conf, gui_conf.value)
+        pts_flat = current_xyz_c.reshape(-1, 3)
+        mask_flat = mask.reshape(-1)
+        rgb_img_for_pts = current_img
+        if rgb_img_for_pts.max() <= 1.0:
+            rgb_img_for_pts = rgb_img_for_pts * 255
+        rgb_flat = rgb_img_for_pts.astype(np.uint8).reshape(-1, 3)
+        return pts_flat[mask_flat], rgb_flat[mask_flat]
+
+    def create_timestep_handles(frame_idx: int) -> None:
+        if frame_idx in frame_roots:
+            return
+
+        f_root_timestep = server.scene.add_frame(f"/frames/t{frame_idx}", show_axes=False)
+        frame_roots[frame_idx] = f_root_timestep
+        loaded_timesteps.add(frame_idx)
 
         for cam_id in cam_ids:
-            frames_roots[cam_id].append(f_root_timestep)
-
-            # Point Cloud
-            current_conf = conf_data[cam_id][i]
-            current_xyz_c = xyz_centered_data[cam_id][i]
-            current_img = img_data[cam_id][i]
-
-            if gui_show_cams[cam_id].value:
-                mask = gen_mask(current_conf, gui_conf.value)
-                # Reshape arrays for masking: (H,W,3) -> (H*W,3) and (H,W) -> (H*W,)
-                pts_flat = current_xyz_c.reshape(-1, 3)
-                mask_flat = mask.reshape(-1)
-                rgb_img_for_pts = current_img
-                if rgb_img_for_pts.max() <= 1.0: rgb_img_for_pts = rgb_img_for_pts * 255
-                rgb_flat = rgb_img_for_pts.astype(np.uint8).reshape(-1, 3)
-                
-                # Apply mask
-                pts = pts_flat[mask_flat]
-                rgb = rgb_flat[mask_flat]
-            else:
-                pts = np.zeros((0,3), np.float32)
-                rgb = np.zeros((0,3), np.uint8)
-
-            pcd_handle  = server.scene.add_point_cloud(
-                f"/frames/t{i}/pc_{cam_id}", pts, rgb, point_size=point_size*(subsample**(1/2)), point_shape="rounded"
+            pts, rgb = build_point_cloud(frame_idx, cam_id)
+            pcd_handle = server.scene.add_point_cloud(
+                f"/frames/t{frame_idx}/pc_{cam_id}",
+                pts,
+                rgb,
+                point_size=gui_point_size.value * (current_subsample[0] ** 0.5),
+                point_shape="rounded",
             )
-            pcd_handles[cam_id].append(pcd_handle)
+            pcd_handles[cam_id][frame_idx] = pcd_handle
 
-            # Frustum
-            norm_i = i/(S-1) if S>1 else 0.0
-            col   = cm.get_cmap('gist_rainbow')(norm_i)[:3]
-            
-            # Since Pi3 doesn't provide intrinsics, we have to use a heuristic for FOV.
-            # This is a limitation. A fixed FOV is a reasonable fallback.
+            norm_i = frame_idx / (S - 1) if S > 1 else 0.0
+            col = cm.get_cmap('gist_rainbow')(norm_i)[:3]
             h_img_cam, w_img_cam = img_data[cam_id].shape[-3:-1]
-            # Use a more reasonable FOV - around 60 degrees (1.047 radians)
-            fov_cam = 1.047  # 60 degrees in radians, typical camera FOV
+            fov_cam = 1.047
             aspect_cam = w_img_cam / h_img_cam
 
-            # Reconstruct 4x4 matrix from 3x4 for SE3
-            cam_pose_3x4 = cam2world_data[cam_id][i]
+            cam_pose_3x4 = cam2world_data[cam_id][frame_idx]
             cam_pose_4x4 = np.eye(4)
             cam_pose_4x4[:3, :] = cam_pose_3x4
             T_cam = vt.SE3.from_matrix(cam_pose_4x4)
-            
-            # Use processed image for frustum view
-            frustum_img = current_img
-            if frustum_img.max() <= 1.0: frustum_img = frustum_img * 255
+
+            frustum_img = img_data[cam_id][frame_idx]
+            if frustum_img.max() <= 1.0:
+                frustum_img = frustum_img * 255
             frustum_img = frustum_img.astype(np.uint8)
 
             frustum_handle = server.scene.add_camera_frustum(
-                f"/frames/t{i}/frustum_{cam_id}", fov_cam, aspect_cam, scale=gui_camera_size.value,
+                f"/frames/t{frame_idx}/frustum_{cam_id}",
+                fov_cam,
+                aspect_cam,
+                scale=gui_camera_size.value,
                 image=frustum_img,
-                wxyz=T_cam.rotation().wxyz, position=T_cam.translation(),
-                color=col, line_width=2.0
+                wxyz=T_cam.rotation().wxyz,
+                position=T_cam.translation(),
+                color=col,
+                line_width=2.0,
             )
-            frustums[cam_id].append(frustum_handle)
+            frustums[cam_id][frame_idx] = frustum_handle
 
-    # ───────────── Update Visibility ─────────────
-    def set_visibility():
+    def remove_timestep_handles(frame_idx: int) -> None:
+        frame_handle = frame_roots.pop(frame_idx, None)
+        if frame_handle is not None:
+            frame_handle.remove()
+        loaded_timesteps.discard(frame_idx)
+        for cam_id in cam_ids:
+            pcd_handles[cam_id].pop(frame_idx, None)
+            frustums[cam_id].pop(frame_idx, None)
+
+    def compute_visible_timesteps() -> List[int]:
         show_all_ts = gui_all.value
         accumulate_on_play = gui_accumulate_play.value and gui_play.value and (not show_all_ts)
-        stride_ts   = gui_stride.value
-        current_ts  = gui_frame.value
+        stride_ts = max(1, gui_stride.value)
+        current_ts = gui_frame.value
+        start_f = min(gui_start_frame.value, gui_end_frame.value)
+        end_f = max(gui_start_frame.value, gui_end_frame.value)
+
+        if show_all_ts:
+            return list(range(start_f, end_f + 1, stride_ts))
+        if accumulate_on_play:
+            if current_ts < start_f:
+                return []
+            capped_end = min(current_ts, end_f)
+            return list(range(start_f, capped_end + 1, stride_ts))
+        if start_f <= current_ts <= end_f:
+            return [current_ts]
+        return []
+
+    # ───────────── Update Visibility / Lazy Sync ─────────────
+    def set_visibility(force_reload: bool = False):
+        target_timesteps = set(compute_visible_timesteps())
+
+        if force_reload:
+            for frame_idx in list(loaded_timesteps):
+                remove_timestep_handles(frame_idx)
+
+        for frame_idx in sorted(target_timesteps - loaded_timesteps):
+            create_timestep_handles(frame_idx)
+
+        for frame_idx in list(loaded_timesteps - target_timesteps):
+            remove_timestep_handles(frame_idx)
+
         master_show_frustums = gui_show_all_cams_master.value
-        start_f = gui_start_frame.value
-        end_f = gui_end_frame.value
-
-        for i in range(S):
-            in_range = (start_f <= i <= end_f)
-            if show_all_ts:
-                vis_timestep_level = (i % stride_ts == 0) and in_range
-            elif accumulate_on_play:
-                vis_timestep_level = (start_f <= i <= current_ts) and (((i - start_f) % stride_ts) == 0) and in_range
-            else:
-                vis_timestep_level = (i == current_ts) and in_range
-            
-            if len(cam_ids) > 0 and frames_roots[cam_ids[0]][i] is not None:
-                 frames_roots[cam_ids[0]][i].visible = vis_timestep_level
-
+        for frame_idx in target_timesteps:
+            frame_handle = frame_roots.get(frame_idx)
+            if frame_handle is not None:
+                frame_handle.visible = True
             for cam_id in cam_ids:
-                individual_cam_active = gui_show_cams[cam_id].value
+                pcd_handle = pcd_handles[cam_id].get(frame_idx)
+                if pcd_handle is not None:
+                    pcd_handle.visible = gui_show_cams[cam_id].value
+                frustum_handle = frustums[cam_id].get(frame_idx)
+                if frustum_handle is not None:
+                    frustum_handle.visible = gui_show_cams[cam_id].value and master_show_frustums
 
-                if pcd_handles[cam_id][i] is not None:
-                    pcd_handles[cam_id][i].visible = vis_timestep_level and individual_cam_active
-                
-                if frustums[cam_id][i] is not None:
-                    frustums[cam_id][i].visible = vis_timestep_level and individual_cam_active and master_show_frustums
-    
+    print("Initializing lazy viser scene for current visible frames …")
     set_visibility()
 
-    # ───────────── Refresh Point Clouds (Confidence Slider) ─────────────
+    # ───────────── Refresh Visible Point Clouds (Confidence Slider) ─────────────
     def refresh_pointclouds():
-        pct = gui_conf.value
-        cur_subsample = current_subsample[0]
-        new_point_size = gui_point_size.value * (cur_subsample ** 0.5)
-        
-        for i in tqdm(range(S), leave=False, desc="Refreshing PCs"):
-            for cam_id in cam_ids:
-                if gui_show_cams[cam_id].value :
-                    current_conf = conf_data[cam_id][i]
-                    current_xyz_c = xyz_centered_data[cam_id][i]
-                    current_img = img_data[cam_id][i]
+        new_point_size = gui_point_size.value * (current_subsample[0] ** 0.5)
 
-                    mask = gen_mask(current_conf, pct)
-                    # Reshape arrays for masking: (H,W,3) -> (H*W,3) and (H,W) -> (H*W,)
-                    pts_flat = current_xyz_c.reshape(-1, 3)
-                    mask_flat = mask.reshape(-1)
-                    rgb_img_for_pts = current_img
-                    if rgb_img_for_pts.max() <= 1.0: rgb_img_for_pts = rgb_img_for_pts * 255
-                    rgb_flat = rgb_img_for_pts.astype(np.uint8).reshape(-1, 3)
-                    
-                    # Apply mask
-                    pts = pts_flat[mask_flat]
-                    rgb = rgb_flat[mask_flat]
-                    
-                    pcd_handles[cam_id][i].points = pts
-                    pcd_handles[cam_id][i].colors = rgb
-                    pcd_handles[cam_id][i].point_size = new_point_size
+        for frame_idx in sorted(loaded_timesteps):
+            for cam_id in cam_ids:
+                pcd_handle = pcd_handles[cam_id].get(frame_idx)
+                if pcd_handle is None or not gui_show_cams[cam_id].value:
+                    continue
+                pts, rgb = build_point_cloud(frame_idx, cam_id)
+                pcd_handle.points = pts
+                pcd_handle.colors = rgb
+                pcd_handle.point_size = new_point_size
 
     # ───────────── GUI Callback Bindings ─────────────
     @gui_next.on_click
@@ -554,9 +564,9 @@ def viser_wrapper(
 
     @gui_point_size.on_update
     def _(_):
-        new_point_size = gui_point_size.value
+        new_point_size = gui_point_size.value * (current_subsample[0] ** 0.5)
         for cam_id in cam_ids:
-            for handle in pcd_handles[cam_id]:
+            for handle in pcd_handles[cam_id].values():
                 if handle is not None:
                     handle.point_size = new_point_size
 
@@ -564,7 +574,7 @@ def viser_wrapper(
     def _(_):
         new_camera_size = gui_camera_size.value
         for cam_id in cam_ids:
-            for handle in frustums[cam_id]:
+            for handle in frustums[cam_id].values():
                 if handle is not None:
                     handle.scale = new_camera_size
 
@@ -604,6 +614,11 @@ def viser_wrapper(
     
     @gui_apply_range.on_click
     def _(_):
+        start_f = min(gui_start_frame.value, gui_end_frame.value)
+        end_f = max(gui_start_frame.value, gui_end_frame.value)
+        if not (start_f <= gui_frame.value <= end_f):
+            gui_frame.value = start_f
+
         new_subsample = gui_subsample.value
         if new_subsample != current_subsample[0]:
             print(f"Applying new subsample: {new_subsample} (was {current_subsample[0]})")
@@ -627,13 +642,13 @@ def viser_wrapper(
                 else:
                     xyz_centered_data[cam_id] = xyz_data[cam_id]
             
-            # Refresh point clouds with new subsample
-            refresh_pointclouds()
+            # Rebuild the currently visible lazy scene with the new subsample.
+            set_visibility(force_reload=True)
             print(f"Subsample updated to {new_subsample}")
         else:
             # Just refresh visibility for frame range
             set_visibility()
-            print(f"Frame range applied: {gui_start_frame.value} - {gui_end_frame.value}")
+            print(f"Frame range applied: {start_f} - {end_f}")
 
     for cam_id in cam_ids:
         # Use a closure to capture the correct cam_id for the callback
